@@ -554,40 +554,49 @@ class DataLoaderShard(DataLoaderAdapter, DataLoaderStateMixin):
         self._non_blocking = _non_blocking
         self.iteration = 0
 
-    def __iter__(self):
-        if self.rng_types is not None:
-            synchronize_rng_states(self.rng_types, self.synchronized_generator)
-        self.begin()
+   def __iter__(self):
+    if self.rng_types is not None:
+        synchronize_rng_states(self.rng_types, self.synchronized_generator)
+    self.begin()
 
-        self.set_epoch(self.iteration)
-        dataloader_iter = self.base_dataloader.__iter__()
-        # We iterate one batch ahead to check when we are at the end
-        try:
-            current_batch = next(dataloader_iter)
-        except StopIteration:
-            yield
+    self.set_epoch(self.iteration)
+    dataloader_iter = iter(self.base_dataloader)  # ✅ 优化 `__iter__` 调用方式
+    current_batch = None  # ✅ 初始化变量，避免 UnboundLocalError
 
-        batch_index = 0
-        while True:
-            try:
-                # But we still move it to the device so it is done before `StopIteration` is reached
-                if self.device is not None:
-                    current_batch = send_to_device(current_batch, self.device, non_blocking=self._non_blocking)
-                self._update_state_dict()
-                next_batch = next(dataloader_iter)
-                if batch_index >= self.skip_batches:
-                    yield current_batch
-                batch_index += 1
-                current_batch = next_batch
-            except StopIteration:
-                self.end_of_dataloader = True
-                self._update_state_dict()
-                if batch_index >= self.skip_batches:
-                    yield current_batch
-                break
-
-        self.iteration += 1
+    # 预取第一批数据
+    try:
+        current_batch = next(dataloader_iter)
+    except StopIteration:
+        self.end_of_dataloader = True
+        self._update_state_dict()
         self.end()
+        return  # ✅ 直接返回，避免 `yield` 未定义变量
+
+    batch_index = 0
+    while True:
+        try:
+            # ✅ 确保 `current_batch` 在传输到设备之前已赋值
+            if self.device is not None and current_batch is not None:
+                current_batch = send_to_device(current_batch, self.device, non_blocking=self._non_blocking)
+
+            self._update_state_dict()
+            next_batch = next(dataloader_iter)
+
+            if batch_index >= self.skip_batches:
+                yield current_batch
+
+            batch_index += 1
+            current_batch = next_batch  # ✅ 确保 `current_batch` 正确赋值
+        except StopIteration:
+            self.end_of_dataloader = True
+            self._update_state_dict()
+            if batch_index >= self.skip_batches and current_batch is not None:
+                yield current_batch  # ✅ 确保最后一个 batch 被正确返回
+            break
+
+    self.iteration += 1
+    self.end()
+
 
     def __reduce__(self):
         """
